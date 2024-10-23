@@ -27,6 +27,7 @@ class Stats:
     # System stats (should have _sys suffix)
     #   Scheduler State
     num_running_sys: int
+    num_ready_sys: int
     num_waiting_sys: int
     num_swapped_sys: int
     #   KV Cache Usage in %

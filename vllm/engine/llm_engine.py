@@ -1770,6 +1770,8 @@ class LLMEngine:
         #   Scheduler State
         num_running_sys = sum(
             len(scheduler.running) for scheduler in self.scheduler)
+        num_ready_sys = sum(
+            len(scheduler.ready) for scheduler in self.scheduler)
         num_swapped_sys = sum(
             len(scheduler.swapped) for scheduler in self.scheduler)
         num_waiting_sys = sum(
@@ -1910,6 +1912,7 @@ class LLMEngine:
             # System stats
             #   Scheduler State
             num_running_sys=num_running_sys,
+            num_ready_sys=num_ready_sys,
             num_swapped_sys=num_swapped_sys,
             num_waiting_sys=num_waiting_sys,
             #   KV Cache Usage in %
