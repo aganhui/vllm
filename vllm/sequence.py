@@ -54,16 +54,17 @@ class SequenceStatus(enum.IntEnum):
     WAITING = 0
     RUNNING = 1
     SWAPPED = 2
+    READY = 3
     # Note: anything after SWAPPED (2) will be considered
     # as a finished status.
-    FINISHED_STOPPED = 3
-    FINISHED_LENGTH_CAPPED = 4
-    FINISHED_ABORTED = 5
-    FINISHED_IGNORED = 6
+    FINISHED_STOPPED = 4
+    FINISHED_LENGTH_CAPPED = 5
+    FINISHED_ABORTED = 6
+    FINISHED_IGNORED = 7
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
-        return status > SequenceStatus.SWAPPED
+        return status > SequenceStatus.READY
 
     @staticmethod
     def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:

@@ -354,6 +354,8 @@ class _AsyncLLMEngine(LLMEngine):
                 self._process_model_outputs(ctx=ctx)
             outputs = []
 
+        self.scheduler[virtual_engine].add_period_cnt()
+
         # Finish the current step for all the sequence groups.
         if self.scheduler_config.is_multi_step:
             for seq_group in seq_group_metadata_list:

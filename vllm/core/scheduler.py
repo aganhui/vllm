@@ -225,12 +225,18 @@ class SchedulerReadyOutputs:
     # Selected sequences that are going to be swapped in and in a prefill
     # phase. I.e., it means the prefill has been chunked.
     prefill_seq_groups: List[ScheduledSequenceGroup]
+    # The blocks to copy.
+    blocks_to_copy: List[Tuple[int, int]]
+    # The number of slots for lookahead decoding.
+    num_lookahead_slots: int
 
     @classmethod
     def create_empty(cls) -> "SchedulerReadyOutputs":
         return SchedulerReadyOutputs(
             decode_seq_groups=[],
             prefill_seq_groups=[],
+            blocks_to_copy=[],
+            num_lookahead_slots=0,
         )
 
 @dataclass
@@ -424,9 +430,13 @@ class Scheduler:
         # for processing and deallocation by the free_finished_seq_groups()
         self._async_stopped: List[SequenceGroup] = []
 
-    @property
-    def period_cnt(self):
-        return self.period_cnt
+    def log_scheduler_state(self):
+        logger.info(f"Scheduler state: period_id={self.period_id} period_cnt={self.period_cnt}")
+        logger.info(f"Scheduler state: waiting={len(self.waiting)} ready={len(self.ready)} running={len(self.running)} swapped={len(self.swapped)}")
+        logger.info(f"Scheduler state: request_id_to_period_id={self.request_id_to_period_id}")
+        logger.info(f"Scheduler state: request_id_to_timeslot_alloc={self.request_id_to_timeslot_alloc}")
+        logger.info(f"Scheduler state: request_id_to_timeslot_consume={self.request_id_to_timeslot_consume}")
+        logger.info(f"Scheduler state: request_id_to_timeslot_surplus={self.request_id_to_timeslot_surplus}")
 
     @property
     def next_cache_id(self):
@@ -442,10 +452,18 @@ class Scheduler:
         return 1
 
     def add_period_cnt(self, plus: int = 1):
-        self.period_cnt += plus
-        self.period_cnt = self.period_cnt % self.scheduler_config.num_period_steps
-        self.period_id += self.period_cnt // self.scheduler_config.num_period_steps
         self._running_consume_timeslot(plus)
+        self.period_cnt += plus
+        period_plus = self.period_cnt // self.scheduler_config.num_period_steps
+        if period_plus > 0:
+            self.period_id += period_plus
+            self.period_cnt = self.period_cnt % self.scheduler_config.num_period_steps
+
+            for state_queue in [self.running, self.ready, self.swapped]:
+                for seq_group in state_queue:
+                    self._alloc_timeslot_to_single_req(seq_group)
+                    self.request_id_to_period_id[seq_group.request_id] = self.period_id
+
         return self.period_id, self.period_cnt
 
     def _alloc_timeslot_to_reqs(self):
@@ -454,7 +472,7 @@ class Scheduler:
 
     def _alloc_timeslot_to_single_req(self, seq_group: SequenceGroup):
         # TODO: timeslot allocation algo.
-        timeslot = 10
+        timeslot = 5
         self.request_id_to_timeslot_alloc[seq_group.request_id] = timeslot
         self.request_id_to_timeslot_consume[seq_group.request_id] = 0
         self.request_id_to_timeslot_surplus[seq_group.request_id] = timeslot
@@ -481,10 +499,12 @@ class Scheduler:
             self.request_id_to_timeslot_surplus[seq_group.request_id] -= time_cnt
 
     def _move_depleted_to_ready(self):
-        for seq_group in self.running:
-            if self.request_id_to_timeslot_surplus[seq_group.request_id] <= 0:
-                self.ready.append(seq_group)
-                self.running.remove(seq_group)
+        depleted = [seq_group for seq_group in self.running if self._whether_timeslot_depleted(seq_group)]
+        for seq_group in depleted:
+            self.request_id_to_period_id[seq_group.request_id] += 1
+            self._running_down_to_ready(seq_group)
+        self.ready.extend(depleted)
+        self.running = deque([seq_group for seq_group in self.running if not self._whether_timeslot_depleted(seq_group)])
 
     def _whether_timeslot_depleted(self, seq_group: SequenceGroup):
         return self.request_id_to_timeslot_surplus[seq_group.request_id] <= 0
@@ -735,6 +755,7 @@ class Scheduler:
         """
         decode_seq_groups: List[ScheduledSequenceGroup] = []
         prefill_seq_groups: List[ScheduledSequenceGroup] = []
+        blocks_to_copy: List[Tuple[int, int]] = []
         ready_queue = self.ready
 
         leftover_ready: Deque[SequenceGroup] = deque()
@@ -765,17 +786,25 @@ class Scheduler:
             # exceed the maximum number of sequences.
             num_new_seqs = seq_group.get_max_num_running_seqs()
             num_new_tokens = self._get_num_new_tokens(seq_group,
-                                                      SequenceStatus.SWAPPED,
+                                                      SequenceStatus.READY,
                                                       enable_chunking, budget)
 
             if (num_new_tokens == 0
                     or not budget.can_schedule(num_new_tokens=num_new_tokens,
                                                num_new_seqs=num_new_seqs)):
-                break
+                leftover_ready.appendleft(seq_group)
+                ready_queue.popleft()
+                continue
 
-            if lora_int_id > 0 and curr_loras is not None:
-                curr_loras.add(lora_int_id)
+            if not self._can_append_slots(seq_group):
+                leftover_ready.appendleft(seq_group)
+                ready_queue.popleft()
+                continue
+            
+            self._ready_up_to_running(seq_group)
+            self._append_slots(seq_group, blocks_to_copy)
             ready_queue.popleft()
+
             is_prefill = seq_group.is_prefill()
             if is_prefill:
                 prefill_seq_groups.append(
@@ -784,14 +813,20 @@ class Scheduler:
             else:
                 decode_seq_groups.append(
                     ScheduledSequenceGroup(seq_group, token_chunk_size=1))
+
             budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
-            budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+            if enable_chunking:
+                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+            if lora_int_id > 0 and curr_loras is not None:
+                curr_loras.add(lora_int_id)
 
         ready_queue.extendleft(leftover_ready)
 
         return SchedulerReadyOutputs(
             decode_seq_groups=decode_seq_groups,
             prefill_seq_groups=prefill_seq_groups,
+            blocks_to_copy=blocks_to_copy,
+            num_lookahead_slots=self._get_num_lookahead_slots(is_prefill=False),
         )
 
     def _schedule_swapped(
@@ -1070,6 +1105,7 @@ class Scheduler:
 
         prefills = SchedulerPrefillOutputs.create_empty()
         running_scheduled = SchedulerRunningOutputs.create_empty()
+        ready_scheduled = SchedulerReadyOutputs.create_empty()
         swapped_in = SchedulerSwappedInOutputs.create_empty()
 
         # If any requests are swapped, prioritized swapped requests.
@@ -1139,6 +1175,7 @@ class Scheduler:
 
         blocks_to_copy = running_scheduled.blocks_to_copy
         blocks_to_copy.extend(swapped_in.blocks_to_copy)
+        blocks_to_copy.extend(ready_scheduled.blocks_to_copy)
 
         ignored_seq_groups = prefills.ignored_seq_groups
         ignored_seq_groups.extend(swapped_in.infeasible_seq_groups)
@@ -1242,6 +1279,7 @@ class Scheduler:
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
             blocks_to_copy=running_scheduled.blocks_to_copy +
+            ready_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
             swapped_in.infeasible_seq_groups,
@@ -1603,6 +1641,22 @@ class Scheduler:
         blocks_to_swap_out.extend(mapping)
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
+
+    def _running_down_to_ready(
+        self,
+        seq_group: SequenceGroup,
+    ) -> None:
+        seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+        for seq in seqs:
+            seq.status = SequenceStatus.READY
+
+    def _ready_up_to_running(
+        self,
+        seq_group: SequenceGroup,
+    ) -> None:
+        seqs = seq_group.get_seqs(status=SequenceStatus.READY)
+        for seq in seqs:
+            seq.status = SequenceStatus.RUNNING
 
     def _passed_delay(self, now: float) -> bool:
         if self.prev_prompt:
