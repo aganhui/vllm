@@ -433,10 +433,10 @@ class Scheduler:
     def log_scheduler_state(self):
         logger.info(f"Scheduler state: period_id={self.period_id} period_cnt={self.period_cnt}")
         logger.info(f"Scheduler state: waiting={len(self.waiting)} ready={len(self.ready)} running={len(self.running)} swapped={len(self.swapped)}")
-        logger.info(f"Scheduler state: request_id_to_period_id={self.request_id_to_period_id}")
-        logger.info(f"Scheduler state: request_id_to_timeslot_alloc={self.request_id_to_timeslot_alloc}")
-        logger.info(f"Scheduler state: request_id_to_timeslot_consume={self.request_id_to_timeslot_consume}")
-        logger.info(f"Scheduler state: request_id_to_timeslot_surplus={self.request_id_to_timeslot_surplus}")
+        # logger.info(f"Scheduler state: request_id_to_period_id={self.request_id_to_period_id}")
+        # logger.info(f"Scheduler state: request_id_to_timeslot_alloc={self.request_id_to_timeslot_alloc}")
+        # logger.info(f"Scheduler state: request_id_to_timeslot_consume={self.request_id_to_timeslot_consume}")
+        # logger.info(f"Scheduler state: request_id_to_timeslot_surplus={self.request_id_to_timeslot_surplus}")
 
     @property
     def next_cache_id(self):
@@ -589,6 +589,17 @@ class Scheduler:
         self._finished_requests_ids = list()
         return finished_requests_ids
 
+    def _budget_subtract_seq_group(self, seq_group: SequenceGroup, budget: SchedulingBudget) -> None:
+        num_running_seqs = seq_group.get_max_num_running_seqs()
+        budget.subtract_num_seqs(seq_group.request_id,
+                                num_running_seqs)
+
+    def _lora_subtract_seq_group(self, seq_group: SequenceGroup, curr_loras: Optional[Set[int]]) -> None:
+
+        if (curr_loras is not None and seq_group.lora_int_id > 0
+                and seq_group.lora_int_id in curr_loras):
+            curr_loras.remove(seq_group.lora_int_id)
+
     def _schedule_running(
         self,
         budget: SchedulingBudget,
@@ -662,16 +673,6 @@ class Scheduler:
             # NOTE(woosuk): Preemption happens only when there is no available
             # slot to keep all the sequence groups in the RUNNING state.
             while not self._can_append_slots(seq_group):
-                budget.subtract_num_batched_tokens(seq_group.request_id,
-                                                   num_running_tokens)
-                num_running_seqs = seq_group.get_max_num_running_seqs()
-                budget.subtract_num_seqs(seq_group.request_id,
-                                         num_running_seqs)
-
-                if (curr_loras is not None and seq_group.lora_int_id > 0
-                        and seq_group.lora_int_id in curr_loras):
-                    curr_loras.remove(seq_group.lora_int_id)
-
                 # Determine victim sequence
                 cont_loop = True
                 if self.ready:
@@ -679,6 +680,8 @@ class Scheduler:
                 elif running_queue:
                     # Preempt the lowest-priority sequence group.
                     victim_seq_group = running_queue.pop()
+                    self._budget_subtract_seq_group(victim_seq_group, budget)
+                    self._lora_subtract_seq_group(victim_seq_group, curr_loras)
                 else:
                     # No other sequence group can be preempted.
                     # Preempt the current sequence group.
@@ -711,6 +714,15 @@ class Scheduler:
                         swapped_out.append(victim_seq_group)
 
                 if not cont_loop:
+                    # only current sequence group is preempted, need to subtract the num_seqs and loras
+
+                    # budget.subtract_num_batched_tokens(seq_group.request_id,
+                    #                                num_running_tokens)
+
+                    if not enable_chunking:
+                        self._budget_subtract_seq_group(seq_group, budget)
+                        self._lora_subtract_seq_group(seq_group, curr_loras)
+
                     break
             else:
                 self._append_slots(seq_group, blocks_to_copy)
@@ -762,6 +774,11 @@ class Scheduler:
         while ready_queue:
             seq_group = ready_queue[0]
 
+            if seq_group.is_finished():
+                # The sequence group is already finished. ()
+                ready_queue.popleft()
+                continue
+
             if self.request_id_to_period_id[seq_group.request_id] < self.period_id:
                 # The request is lagged behind the current period.
                 pass
@@ -796,12 +813,13 @@ class Scheduler:
                 ready_queue.popleft()
                 continue
 
+            self._ready_up_to_running(seq_group)
             if not self._can_append_slots(seq_group):
+                self._running_down_to_ready(seq_group)
                 leftover_ready.appendleft(seq_group)
                 ready_queue.popleft()
                 continue
-            
-            self._ready_up_to_running(seq_group)
+
             self._append_slots(seq_group, blocks_to_copy)
             ready_queue.popleft()
 
@@ -815,8 +833,7 @@ class Scheduler:
                     ScheduledSequenceGroup(seq_group, token_chunk_size=1))
 
             budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
-            if enable_chunking:
-                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+            budget.add_num_seqs(seq_group.request_id, num_new_seqs)
             if lora_int_id > 0 and curr_loras is not None:
                 curr_loras.add(lora_int_id)
 
@@ -1109,7 +1126,7 @@ class Scheduler:
         swapped_in = SchedulerSwappedInOutputs.create_empty()
 
         # If any requests are swapped, prioritized swapped requests.
-        if not self.swapped and not self.ready:
+        if not self.swapped:
             prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
@@ -1333,6 +1350,8 @@ class Scheduler:
 
         scheduler_outputs = self._schedule()
         now = time.time()
+
+        # self.log_scheduler_state()
 
         if not self.cache_config.enable_prefix_caching:
             common_computed_block_nums = []
@@ -1602,7 +1621,9 @@ class Scheduler:
         self,
         seq_group: SequenceGroup,
     ) -> None:
-        seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+        seqs_running = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+        seqs_ready = seq_group.get_seqs(status=SequenceStatus.READY)
+        seqs = seqs_running + seqs_ready
         assert len(seqs) == 1
         for seq in seqs:
             seq.status = SequenceStatus.WAITING

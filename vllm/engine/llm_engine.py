@@ -1860,9 +1860,11 @@ class LLMEngine:
                         num_generation_tokens_from_prefill_groups += (
                             seq_group.num_seqs())
                 else:
-                    # TPOTs.
-                    latency = seq_group.get_last_latency(now)
-                    time_per_output_tokens_iter.append(latency)
+                    # NOTE: a decode seq_group that be preempt(recompute) will have group_was_prefill = False and seq_group.is_prefill() = True
+                    if not seq_group.is_prefill():
+                        # TPOTs.
+                        latency = seq_group.get_last_latency(now)
+                        time_per_output_tokens_iter.append(latency)
 
                 # Because of chunked prefill, we can have a single sequence
                 # group that does multiple prompt_runs. To prevent logging
